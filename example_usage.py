@@ -39,8 +39,8 @@ contract.resolve_dispute("inv-2201")
 # is also substantiated, so validators converge on a partial release rather
 # than an all-or-nothing outcome.
 
-print(contract.disputes["inv-2201"]["verdict"])
-print(contract.disputes["inv-2201"]["status"])  # "resolved"
+print(contract.disputes["inv-2201"].verdict)
+print(contract.disputes["inv-2201"].status)  # "resolved"
 
 # What a validator is actually checking at step 4: not whether their own LLM
 # produces the exact string "split:76", but whether the leader's proposed

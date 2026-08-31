@@ -1,45 +1,58 @@
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 from genlayer import *
+from dataclasses import dataclass
 import typing
 
 
+@allow_storage
+@dataclass
+class Dispute:
+    claimant: str
+    respondent: str
+    evidence_claimant: str
+    evidence_respondent: str
+    escrow: u256
+    status: str
+    verdict: str
+
+
 class EvidenceArbitrator(gl.Contract):
-    disputes: dict[str, dict]  # dispute_id -> {claimant, respondent, evidence_claimant, evidence_respondent, escrow, status, verdict}
+    disputes: TreeMap[str, Dispute]
 
     def __init__(self):
-        self.disputes = {}
+        self.disputes = TreeMap()
 
     @gl.public.write
     def open_dispute(self, dispute_id: str, claimant: str, respondent: str, escrow: int) -> None:
-        self.disputes[dispute_id] = {
-            "claimant": claimant,
-            "respondent": respondent,
-            "evidence_claimant": "",
-            "evidence_respondent": "",
-            "escrow": escrow,
-            "status": "open",
-            "verdict": "",
-        }
+        self.disputes[dispute_id] = Dispute(
+            claimant=claimant,
+            respondent=respondent,
+            evidence_claimant="",
+            evidence_respondent="",
+            escrow=u256(escrow),
+            status="open",
+            verdict="",
+        )
 
     @gl.public.write
     def submit_evidence(self, dispute_id: str, party: str, evidence: str) -> None:
         d = self.disputes[dispute_id]
-        if party == d["claimant"]:
-            d["evidence_claimant"] = evidence
-        elif party == d["respondent"]:
-            d["evidence_respondent"] = evidence
+        if party == d.claimant:
+            d.evidence_claimant = evidence
+        elif party == d.respondent:
+            d.evidence_respondent = evidence
 
     @gl.public.write
     def resolve_dispute(self, dispute_id: str) -> None:
         d = self.disputes[dispute_id]
 
-        if d["status"] == "resolved":
+        if d.status == "resolved":
             return  # no-op: already resolved
 
         def get_verdict() -> str:
             return f"""
-            Claimant's evidence: {d['evidence_claimant']}
-            Respondent's evidence: {d['evidence_respondent']}
+            Claimant's evidence: {d.evidence_claimant}
+            Respondent's evidence: {d.evidence_respondent}
             Determine who fulfilled their obligation and how escrow should be released.
             """
 
@@ -54,5 +67,5 @@ class EvidenceArbitrator(gl.Contract):
             """
         )
 
-        d["verdict"] = verdict
-        d["status"] = "resolved"
+        d.verdict = verdict
+        d.status = "resolved"
