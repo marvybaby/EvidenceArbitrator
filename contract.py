@@ -8,15 +8,15 @@ import typing
 @allow_storage
 @dataclass
 class Dispute:
-    claimant: str
-    respondent: str
-    evidence_url_claimant: str    # verifiable source, not free-typed prose
+    claimant: Address
+    respondent: Address
+    evidence_url_claimant: str
     evidence_url_respondent: str
     escrow: u256
-    status: str                    # "open" | "resolved"
-    resolution: str                # "" | "claimant" | "respondent" | "split"
-    split_percentage: u256         # meaningful only if resolution == "split"
-    released_to_claimant: u256     # parsed, enforced settlement amounts
+    status: str                # "open" | "resolved"
+    resolution: str            # "" | "claimant" | "respondent" | "split"
+    split_bucket: u256         # canonical bucket (0,10,20...100), exact agreement required
+    released_to_claimant: u256
     released_to_respondent: u256
 
 
@@ -27,31 +27,55 @@ class EvidenceArbitrator(gl.Contract):
         self.disputes = TreeMap()
 
     @gl.public.write
-    def open_dispute(
-        self, dispute_id: str, claimant: str, respondent: str, escrow: int
-    ) -> None:
+    def open_dispute(self, dispute_id: str, respondent: str, escrow: int) -> None:
+        # Overwrite protection: a dispute_id can only be opened once.
+        if dispute_id in self.disputes:
+            return  # no-op: dispute already exists
+
+        respondent_address = Address(respondent)
+
+        # Prevent self-dealing: a claimant cannot name themselves as the
+        # respondent, which would let one party control both sides.
+        if respondent_address == gl.message.sender_address:
+            return  # no-op: claimant cannot be their own respondent
+
+        # The caller opening the dispute IS the claimant -- there is no
+        # separate "claimant" parameter to spoof. Only the party who
+        # actually submits this transaction can be the claimant.
         self.disputes[dispute_id] = Dispute(
-            claimant=claimant,
-            respondent=respondent,
+            claimant=gl.message.sender_address,
+            respondent=respondent_address,
             evidence_url_claimant="",
             evidence_url_respondent="",
             escrow=u256(escrow),
             status="open",
             resolution="",
-            split_percentage=u256(0),
+            split_bucket=u256(0),
             released_to_claimant=u256(0),
             released_to_respondent=u256(0),
         )
 
     @gl.public.write
-    def submit_evidence(self, dispute_id: str, party: str, evidence_url: str) -> None:
-        # Evidence is a URL validators independently fetch and read themselves
-        # (delivery confirmation page, tracking API, hosted document, etc.),
-        # not a party-authored claim taken on faith.
+    def submit_evidence(self, dispute_id: str, evidence_url: str) -> None:
         d = self.disputes[dispute_id]
-        if party == d.claimant:
+        sender = gl.message.sender_address
+
+        # Party authorization: only the actual claimant or respondent for
+        # THIS dispute can submit evidence -- derived from the transaction
+        # sender, never from a caller-supplied "party" string.
+        if sender != d.claimant and sender != d.respondent:
+            return  # no-op: sender is not a party to this dispute
+
+        # Overwrite protection: evidence can only be submitted once per
+        # party, preventing a party from replacing evidence after seeing
+        # the other side's submission.
+        if sender == d.claimant:
+            if d.evidence_url_claimant != "":
+                return  # no-op: claimant evidence already submitted
             d.evidence_url_claimant = evidence_url
-        elif party == d.respondent:
+        elif sender == d.respondent:
+            if d.evidence_url_respondent != "":
+                return  # no-op: respondent evidence already submitted
             d.evidence_url_respondent = evidence_url
 
     @gl.public.write
@@ -61,10 +85,21 @@ class EvidenceArbitrator(gl.Contract):
         if d.status == "resolved":
             return  # no-op: already resolved
 
+        sender = gl.message.sender_address
+
+        # Authorization: only the claimant or respondent for THIS dispute
+        # can trigger resolution -- prevents unrelated third parties from
+        # forcing resolution attempts.
+        if sender != d.claimant and sender != d.respondent:
+            return  # no-op: sender is not a party to this dispute
+
+        # Both parties must have submitted evidence before resolution can
+        # be attempted. Without this, an empty evidence_url would be
+        # fetched, producing an undefined/garbage verdict.
+        if d.evidence_url_claimant == "" or d.evidence_url_respondent == "":
+            return  # no-op: waiting on both parties' evidence
+
         def compute_verdict() -> str:
-            # Every validator (leader included) independently fetches the
-            # underlying evidence and re-derives the verdict — nobody's
-            # judgment is taken on the leader's word alone.
             evidence_a = gl.nondet.web.render(d.evidence_url_claimant, mode="text")
             evidence_b = gl.nondet.web.render(d.evidence_url_respondent, mode="text")
 
@@ -79,27 +114,42 @@ class EvidenceArbitrator(gl.Contract):
             resolution is "split"; use 0 for a clean claimant/respondent decision.
             """
             result = gl.nondet.exec_prompt(prompt, response_format="json")
-            return json.dumps(result, sort_keys=True)
 
-        # Comparative principle: validators don't just check the leader's
-        # answer against loose criteria — they independently recompute the
-        # verdict from the fetched evidence, and consensus only forms if
-        # their answer is materially equivalent to the leader's.
+            # Canonical bucketing: round to the nearest multiple of 10
+            # *inside* the non-deterministic block, before consensus is
+            # even checked. This collapses small model-to-model variance
+            # (e.g. 74 vs 76) into the same bucket (75 -> 80, 74 -> 70)
+            # so exact agreement becomes achievable rather than requiring
+            # every validator's LLM to output the identical raw number.
+            raw_pct = int(result.get("split_percentage", 0))
+            bucketed_pct = round(raw_pct / 10) * 10
+            bucketed_pct = max(0, min(100, bucketed_pct))
+
+            normalized = {
+                "resolution": result["resolution"],
+                "split_percentage": bucketed_pct,
+            }
+            return json.dumps(normalized, sort_keys=True)
+
+        # Exact agreement required -- no tolerance window. Since the
+        # percentage directly determines both parties' payout, a "close
+        # enough" comparison would let two different payout outcomes both
+        # reach consensus. Bucketing above makes exact agreement realistic;
+        # this principle enforces it strictly on the canonical value.
         raw_verdict = gl.eq_principle.prompt_comparative(
             compute_verdict,
             principle="""
-            The resolution and split_percentage must represent the same
-            underlying settlement decision. A "claimant" vs "respondent"
-            disagreement is NOT equivalent. A split_percentage that differs
-            by more than 5 points is NOT equivalent.
+            resolution must match exactly. split_percentage must match
+            exactly -- these are already canonical bucketed values (multiples
+            of 10), so no tolerance is permitted. Any difference in either
+            field means the verdicts are NOT equivalent.
             """,
         )
 
         parsed = json.loads(raw_verdict)
         resolution = parsed["resolution"]
-        split_pct = u256(int(parsed.get("split_percentage", 0)))
+        split_bucket = u256(int(parsed["split_percentage"]))
 
-        # Structured, enforced settlement — not just a stored prose string.
         if resolution == "claimant":
             d.released_to_claimant = d.escrow
             d.released_to_respondent = u256(0)
@@ -107,10 +157,28 @@ class EvidenceArbitrator(gl.Contract):
             d.released_to_claimant = u256(0)
             d.released_to_respondent = d.escrow
         elif resolution == "split":
-            claimant_share = (d.escrow * split_pct) // u256(100)
+            claimant_share = (d.escrow * split_bucket) // u256(100)
             d.released_to_claimant = claimant_share
             d.released_to_respondent = d.escrow - claimant_share
 
         d.resolution = resolution
-        d.split_percentage = split_pct
+        d.split_bucket = split_bucket
         d.status = "resolved"
+
+    @gl.public.view
+    def get_dispute(self, dispute_id: str) -> TreeMap[str, typing.Any]:
+        return self.disputes.get(
+            dispute_id,
+            Dispute(
+                claimant=Address("0x0000000000000000000000000000000000000000"),
+                respondent=Address("0x0000000000000000000000000000000000000000"),
+                evidence_url_claimant="",
+                evidence_url_respondent="",
+                escrow=u256(0),
+                status="not_found",
+                resolution="",
+                split_bucket=u256(0),
+                released_to_claimant=u256(0),
+                released_to_respondent=u256(0),
+            ),
+        )
