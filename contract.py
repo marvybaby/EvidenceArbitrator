@@ -1,4 +1,4 @@
-# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+﻿# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 from genlayer import *
 from dataclasses import dataclass
 import json
@@ -150,6 +150,16 @@ class EvidenceArbitrator(gl.Contract):
         resolution = parsed["resolution"]
         split_bucket = u256(int(parsed["split_percentage"]))
 
+        # Validate the consensus result itself before touching any state.
+        # An agreed-but-invalid resolution (anything other than exactly
+        # these three values) must not be able to slip through and still
+        # mark the dispute resolved with no real allocation.
+        if resolution not in ("claimant", "respondent", "split"):
+            raise Exception(
+                f"Invalid resolution from consensus: {resolution!r}. "
+                "Expected 'claimant', 'respondent', or 'split'."
+            )
+
         if resolution == "claimant":
             d.released_to_claimant = d.escrow
             d.released_to_respondent = u256(0)
@@ -160,6 +170,18 @@ class EvidenceArbitrator(gl.Contract):
             claimant_share = (d.escrow * split_bucket) // u256(100)
             d.released_to_claimant = claimant_share
             d.released_to_respondent = d.escrow - claimant_share
+
+        # Defensive completeness check: the allocation must fully account
+        # for the escrow. If it doesn't (e.g. an unexpected split_bucket
+        # value, or an integer division edge case), reject the resolution
+        # rather than silently marking the dispute resolved with an
+        # incomplete or mismatched payout.
+        if d.released_to_claimant + d.released_to_respondent != d.escrow:
+            raise Exception(
+                "Allocation does not sum to escrow; rejecting resolution "
+                f"(claimant={d.released_to_claimant}, "
+                f"respondent={d.released_to_respondent}, escrow={d.escrow})."
+            )
 
         d.resolution = resolution
         d.split_bucket = split_bucket
